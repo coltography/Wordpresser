@@ -13,6 +13,8 @@ Write in Obsidian, publish to your **self-hosted WordPress** site (WordPress.org
 - Side-by-side images, text alignment, external links open in a new tab
 - Optional per-post folders so each post's images live with the post
 - Preview button for published posts and drafts
+- Image rename, size presets and captions from the hover controls or right-click menu
+- Note title, note name and folder name stay in sync both ways
 
 ## Setup
 
@@ -30,7 +32,7 @@ Write in Obsidian, publish to your **self-hosted WordPress** site (WordPress.org
 | `![[photo.png\|expand]]` / `\|noexpand` | Force click-to-expand on or off for this image |
 | Right-click an image → Small / Medium / Original | Sets the width (sizes are configurable in settings) |
 | Two images on one line | Shown side by side |
-| Right-click → Align text | Left, center or right alignment |
+| Right-click → Align text | Left, center or right alignment (stored as an invisible marker at the end of the line) |
 
 Hover an image in the editor for an **Expand** checkbox and a **Caption** button, or right-click it.
 

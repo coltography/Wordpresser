@@ -315,3 +315,11 @@
 .wpp-imgchk input {
   margin: 0;
 }
+
+/* alignment (stored as an invisible end-of-line marker) */
+.cm-line.wpp-line-center {
+  text-align: center;
+}
+.cm-line.wpp-line-right {
+  text-align: right;
+}

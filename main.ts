@@ -12,12 +12,22 @@ import {
 	SecretComponent,
 	Setting,
 	TFile,
+	TFolder,
+	editorLivePreviewField,
 	normalizePath,
 	parseYaml,
 	requestUrl,
 	setIcon,
 } from "obsidian";
 import { marked, Renderer } from "marked";
+import { RangeSetBuilder } from "@codemirror/state";
+import {
+	Decoration,
+	DecorationSet,
+	EditorView,
+	ViewPlugin,
+	ViewUpdate,
+} from "@codemirror/view";
 
 /* ------------------------------------------------------------------ */
 /* Types & constants                                                   */
@@ -45,6 +55,9 @@ interface WPSettings {
 	lightbox: boolean;
 	sortNotesFirst: boolean;
 	sizeSmall: number;
+	imageRename: boolean;
+	syncMediaCaption: boolean;
+	tagSlugs: boolean;
 	sizeMedium: number;
 	alignMenu: boolean;
 	perPostFolders: boolean;
@@ -70,6 +83,9 @@ const DEFAULT_SETTINGS: WPSettings = {
 	lightbox: true,
 	sortNotesFirst: true,
 	sizeSmall: 300,
+	imageRename: true,
+	syncMediaCaption: true,
+	tagSlugs: true,
 	sizeMedium: 500,
 	alignMenu: true,
 	perPostFolders: true,
@@ -123,6 +139,7 @@ interface ImgUnit {
 
 interface TermInfo {
 	name: string;
+	slug: string;
 	count: number;
 }
 
@@ -184,6 +201,78 @@ function buildEmbed(p: EmbedParts): string {
 	if (p.width) bits.push(p.width); // keep last
 	return `![[${bits.join("|")}]]`;
 }
+
+function slugify(s: string): string {
+	return s
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+/* Alignment is stored as a small invisible marker at the end of a line:
+   <span class="wpp-c"></span> (center) or <span class="wpp-r"></span> (right). */
+const ALIGN_MARK = {
+	center: '<span class="wpp-c"></span>',
+	right: '<span class="wpp-r"></span>',
+};
+const ALIGN_RE = /\s*<span class="wpp-([cr])"><\/span>\s*$/;
+
+/** Editor extension: aligns marked lines and hides the marker in Live Preview. */
+const alignPlugin = ViewPlugin.fromClass(
+	class {
+		decorations: DecorationSet;
+		atomic: DecorationSet;
+		constructor(view: EditorView) {
+			const r = this.build(view);
+			this.decorations = r.all;
+			this.atomic = r.atomic;
+		}
+		update(u: ViewUpdate) {
+			if (u.docChanged || u.viewportChanged || u.transactions.length) {
+				const r = this.build(u.view);
+				this.decorations = r.all;
+				this.atomic = r.atomic;
+			}
+		}
+		build(view: EditorView) {
+			const live = view.state.field(editorLivePreviewField, false) ?? false;
+			const all = new RangeSetBuilder<Decoration>();
+			const atomic = new RangeSetBuilder<Decoration>();
+			const doc = view.state.doc;
+			let last = -1;
+			for (const { from, to } of view.visibleRanges) {
+				let pos = from;
+				while (pos <= to) {
+					const line = doc.lineAt(pos);
+					pos = line.to + 1;
+					if (line.from <= last) continue;
+					last = line.from;
+					const m = /<span class="wpp-([cr])"><\/span>\s*$/.exec(line.text);
+					if (!m) continue;
+					all.add(
+						line.from,
+						line.from,
+						Decoration.line({ class: m[1] === "c" ? "wpp-line-center" : "wpp-line-right" })
+					);
+					if (live) {
+						const rep = Decoration.replace({});
+						const s = line.from + m.index;
+						all.add(s, line.to, rep);
+						atomic.add(s, line.to, rep);
+					}
+				}
+			}
+			return { all: all.finish(), atomic: atomic.finish() };
+		}
+	},
+	{
+		decorations: (v) => v.decorations,
+		provide: (p) =>
+			EditorView.atomicRanges.of((view) => view.plugin(p)?.atomic ?? Decoration.none),
+	}
+);
 
 function sanitizeName(s: string): string {
 	return s
@@ -306,6 +395,15 @@ export default class WPPublisherPlugin extends Plugin {
 
 		this.addSettingTab(new WPSettingTab(this.app, this));
 
+		// Alignment: editor display + reading view
+		this.registerEditorExtension(alignPlugin);
+		this.registerMarkdownPostProcessor((el) => {
+			el.querySelectorAll<HTMLElement>("span.wpp-c, span.wpp-r").forEach((s) => {
+				const block = s.closest<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li");
+				if (block) block.style.textAlign = s.classList.contains("wpp-c") ? "center" : "right";
+			});
+		});
+
 		// Right-click alignment menu
 		this.registerEvent(
 			this.app.workspace.on("editor-menu", (menu, editor) => {
@@ -376,25 +474,56 @@ export default class WPPublisherPlugin extends Plugin {
 				})
 			);
 
-			// Note renamed -> rename its post folder to match
+			// Renames: note -> folder + title property, folder -> note
 			this.registerEvent(
 				this.app.vault.on("rename", async (f, oldPath) => {
-					if (!this.settings.perPostFolders) return;
+					const oldName = oldPath.split("/").pop()!.replace(/\.md$/, "");
+
+					// A post folder was renamed -> rename its note to match
+					if (f instanceof TFolder) {
+						if (!this.settings.perPostFolders || oldName === f.name) return;
+						const note = f.children.find(
+							(c): c is TFile =>
+								c instanceof TFile && c.extension === "md" && c.basename === oldName
+						);
+						if (!note || !this.inScope(note)) return;
+						const clean = sanitizeName(f.name);
+						if (!clean || clean === note.basename) return;
+						const target = joinPath(f.path, clean + ".md");
+						if (this.app.vault.getAbstractFileByPath(target)) return;
+						try {
+							await this.app.fileManager.renameFile(note, target);
+						} catch (e) {
+							console.error("Wordpresser note rename failed", e);
+						}
+						return;
+					}
+
 					if (!(f instanceof TFile) || f.extension !== "md") return;
-					const oldName = oldPath
-						.split("/")
-						.pop()!
-						.replace(/\.md$/, "");
 					if (oldName === f.basename) return;
-					const folder = f.parent;
-					if (!folder || folder.isRoot() || folder.name !== oldName) return;
-					const parentPath = folder.parent?.path ?? "";
-					const target = joinPath(parentPath, f.basename);
-					if (this.app.vault.getAbstractFileByPath(target)) return;
-					try {
-						await this.app.fileManager.renameFile(folder, target);
-					} catch (e) {
-						console.error("Wordpresser folder rename failed", e);
+
+					// 1) rename its post folder to match
+					if (this.settings.perPostFolders) {
+						const folder = f.parent;
+						if (folder && !folder.isRoot() && folder.name === oldName) {
+							const target = joinPath(folder.parent?.path ?? "", f.basename);
+							if (!this.app.vault.getAbstractFileByPath(target)) {
+								try {
+									await this.app.fileManager.renameFile(folder, target);
+								} catch (e) {
+									console.error("Wordpresser folder rename failed", e);
+								}
+							}
+						}
+					}
+
+					// 2) keep the title property in step with the new name
+					if (this.settings.syncNameToTitle && this.inScope(f)) {
+						try {
+							await this.titleFromName(f);
+						} catch (e) {
+							console.error("Wordpresser title sync failed", e);
+						}
 					}
 				})
 			);
@@ -439,6 +568,16 @@ export default class WPPublisherPlugin extends Plugin {
 				const loc = this.locateEmbed(editor, null);
 				if (!loc) return void new Notice("Put the cursor on a line with an image.");
 				this.editCaption(editor, loc);
+			},
+		});
+		this.addCommand({
+			id: "image-rename",
+			name: "Rename image at cursor",
+			editorCallback: (editor) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const loc = this.locateEmbed(editor, null);
+				if (!view || !loc) return void new Notice("Put the cursor on a line with an image.");
+				this.renameImage(view, loc);
 			},
 		});
 		this.addCommand({
@@ -633,9 +772,56 @@ export default class WPPublisherPlugin extends Plugin {
 		editor: Editor,
 		loc: { line: number; from: number; to: number; text: string; parts: EmbedParts }
 	) {
-		new CaptionModal(this.app, loc.parts.caption, (caption) => {
-			this.applyEmbed(editor, loc, { ...loc.parts, caption });
+		new TextModal(this.app, {
+			title: "Image caption",
+			note: "Shown under the image on WordPress. Leave empty for no caption.",
+			placeholder: "Caption",
+			initial: loc.parts.caption,
+			onSave: (v) => {
+				// keep it safe inside ![[file|caption]]
+				const caption = v.replace(/\|/g, "/").replace(/[\[\]]/g, "").trim();
+				this.applyEmbed(editor, loc, { ...loc.parts, caption });
+			},
 		}).open();
+	}
+
+	/** Rename the image file (name only, extension stays). Links update automatically. */
+	renameImage(
+		view: MarkdownView,
+		loc: { parts: EmbedParts }
+	) {
+		const file = this.app.metadataCache.getFirstLinkpathDest(
+			loc.parts.target.split("#")[0].trim(),
+			view.file?.path ?? ""
+		);
+		if (!file) return void new Notice("Couldn't find that image file.");
+		new TextModal(this.app, {
+			title: "Rename image",
+			note: `Just the name. The .${file.extension} stays. Descriptive names help search engines.`,
+			placeholder: "self-portrait-2026",
+			initial: file.basename,
+			onSave: async (v) => {
+				const clean = sanitizeName(v);
+				if (!clean || clean === file.basename) return;
+				const dir = file.parent && !file.parent.isRoot() ? file.parent.path : "";
+				const target = joinPath(dir, `${clean}.${file.extension}`);
+				if (this.app.vault.getAbstractFileByPath(target))
+					return void new Notice(`"${clean}.${file.extension}" already exists.`);
+				try {
+					await this.app.fileManager.renameFile(file, target);
+				} catch (e) {
+					new Notice(`Couldn't rename: ${(e as Error).message}`);
+				}
+			},
+		}).open();
+	}
+
+	resetDecorations() {
+		document.querySelectorAll(".wpp-imgbar").forEach((e) => e.remove());
+		document
+			.querySelectorAll(".wpp-decorated")
+			.forEach((e) => e.classList.remove("wpp-decorated"));
+		this.queueDecorate();
 	}
 
 	private viewForEl(el: HTMLElement): MarkdownView | null {
@@ -682,6 +868,14 @@ export default class WPPublisherPlugin extends Plugin {
 				.setIcon("captions")
 				.onClick(() => this.editCaption(editor, loc))
 		);
+		if (this.settings.imageRename) {
+			menu.addItem((i) =>
+				i
+					.setTitle("Rename image…")
+					.setIcon("pencil")
+					.onClick(() => this.renameImage(view, loc))
+			);
+		}
 		menu.addItem((i) =>
 			i
 				.setTitle("Expand on click (lightbox)")
@@ -731,6 +925,14 @@ export default class WPPublisherPlugin extends Plugin {
 					attr: { title: "Add or edit this image's caption" },
 				});
 
+				const ren = this.settings.imageRename
+					? bar.createEl("button", {
+							cls: "wpp-imgcap",
+							text: "Rename",
+							attr: { title: "Rename this image file" },
+					  })
+					: null;
+
 				for (const t of ["mousedown", "click", "dblclick"])
 					bar.addEventListener(t, (e) => e.stopPropagation());
 
@@ -754,6 +956,11 @@ export default class WPPublisherPlugin extends Plugin {
 						return;
 					}
 					this.toggleExpand(view.editor, loc);
+				});
+				ren?.addEventListener("click", (e) => {
+					e.preventDefault();
+					const { view, loc } = current();
+					if (view && loc) this.renameImage(view, loc);
 				});
 				cap.addEventListener("click", (e) => {
 					e.preventDefault();
@@ -810,6 +1017,17 @@ export default class WPPublisherPlugin extends Plugin {
 		await this.app.vault.createFolder(folderPath);
 		await this.app.fileManager.renameFile(file, joinPath(folderPath, name + ".md"));
 		return true;
+	}
+
+	/** Set the title property from the note's name, if it isn't already in step. */
+	private async titleFromName(file: TFile) {
+		const fm = await this.readFrontmatter(file);
+		if (!("title" in fm)) return; // note doesn't use a title property
+		const cur = fm.title == null ? "" : String(fm.title);
+		if (sanitizeName(cur) === file.basename) return;
+		await this.app.fileManager.processFrontMatter(file, (x) => {
+			x.title = file.basename;
+		});
 	}
 
 	/** Rename a note (and, via the rename handler, its folder) to match a title. */
@@ -974,22 +1192,26 @@ export default class WPPublisherPlugin extends Plugin {
 
 		const inner: string[] = [];
 		for (let n = innerStart; n <= innerEnd; n++) inner.push(line(n));
-		const text = inner.join("\n");
 
-		let replacement: string;
-		if (align === "left") {
-			if (!wrapped) {
-				new Notice("This text isn't aligned yet.");
-				return;
-			}
-			replacement = text;
-		} else {
-			replacement = `<div style="text-align:${align}">\n\n${text}\n\n</div>`;
+		const hadMarks = inner.some((l) => ALIGN_RE.test(l));
+		if (align === "left" && !wrapped && !hadMarks) {
+			new Notice("This text isn't aligned yet.");
+			return;
 		}
+
+		const processed = inner.map((l) => {
+			if (!l.trim()) return l;
+			const bare = l.replace(ALIGN_RE, "");
+			return align === "left" ? bare : `${bare} ${ALIGN_MARK[align]}`;
+		});
+
+		// If the text sat inside an old-style <div> wrapper, the wrapper is dropped
+		const from2 = wrapped ? blockStart : start;
+		const to2 = wrapped ? blockEnd : end;
 		editor.replaceRange(
-			replacement,
-			{ line: blockStart, ch: 0 },
-			{ line: blockEnd, ch: line(blockEnd).length }
+			processed.join("\n"),
+			{ line: from2, ch: 0 },
+			{ line: to2, ch: line(to2).length }
 		);
 	}
 
@@ -1202,11 +1424,12 @@ export default class WPPublisherPlugin extends Plugin {
 			for (let page = 1; page <= 10; page++) {
 				const batch = (await this.wp(
 					"GET",
-					`${taxonomy}?per_page=100&page=${page}&orderby=name&order=asc&_fields=id,name,count`
-				)) as { name: string; count: number }[];
+					`${taxonomy}?per_page=100&page=${page}&orderby=name&order=asc&_fields=id,name,count,slug`
+				)) as { name: string; slug: string; count: number }[];
 				names.push(
 					...batch.map((t) => ({
 						name: decodeEntities(t.name),
+						slug: t.slug ?? "",
 						count: t.count ?? 0,
 					}))
 				);
@@ -1221,25 +1444,26 @@ export default class WPPublisherPlugin extends Plugin {
 	private async resolveTerms(
 		taxonomy: "categories" | "tags",
 		names: string[]
-	): Promise<number[]> {
-		const ids: number[] = [];
+	): Promise<{ id: number; slug: string }[]> {
+		const out: { id: number; slug: string }[] = [];
 		for (const name of names) {
-			const found = await this.wp(
+			const want = slugify(name);
+			const found = (await this.wp(
 				"GET",
-				`${taxonomy}?search=${encodeURIComponent(name)}&per_page=100`
-			);
-			const match = (found as { id: number; name: string }[]).find(
-				(t) =>
-					decodeEntities(t.name).toLowerCase() === name.toLowerCase()
-			);
+				`${taxonomy}?search=${encodeURIComponent(name)}&per_page=100&_fields=id,name,slug`
+			)) as { id: number; name: string; slug: string }[];
+			// match by name, or by slug (so "3d-printing" finds "3d printing")
+			const match =
+				found.find((t) => decodeEntities(t.name).toLowerCase() === name.toLowerCase()) ??
+				found.find((t) => t.slug === want);
 			if (match) {
-				ids.push(match.id);
+				out.push({ id: match.id, slug: match.slug });
 			} else {
 				const created = await this.wp("POST", taxonomy, { name });
-				ids.push(created.id);
+				out.push({ id: created.id, slug: created.slug });
 			}
 		}
-		return ids;
+		return out;
 	}
 
 	private async uploadBinary(
@@ -1526,6 +1750,55 @@ export default class WPPublisherPlugin extends Plugin {
 		return md;
 	}
 
+	/** Turns end-of-line alignment markers into aligned <div> blocks for WordPress. */
+	private convertAlignMarkers(md: string): string {
+		const out: string[] = [];
+		let group: { align: string; lines: string[] } | null = null;
+		const flush = () => {
+			if (!group) return;
+			if (out.length && out[out.length - 1].trim() !== "") out.push("");
+			out.push(`<div style="text-align:${group.align}">`, "", ...group.lines, "", "</div>", "");
+			group = null;
+		};
+		for (const line of md.split("\n")) {
+			const m = line.match(ALIGN_RE);
+			if (m) {
+				const a = m[1] === "c" ? "center" : "right";
+				if (group && group.align !== a) flush();
+				if (!group) group = { align: a, lines: [] };
+				group.lines.push(line.replace(ALIGN_RE, ""));
+			} else {
+				flush();
+				out.push(line);
+			}
+		}
+		flush();
+		return out.join("\n");
+	}
+
+	/** Fill in each image's caption (and empty alt text) in the WordPress media library. */
+	private async syncMediaMeta() {
+		if (!this.settings.syncMediaCaption) return;
+		const done = new Set<number>();
+		for (const u of this.imgUnits) {
+			if (!u.id || !u.caption || done.has(u.id)) continue;
+			done.add(u.id);
+			try {
+				const cur = await this.wp(
+					"GET",
+					`media/${u.id}?context=edit&_fields=id,alt_text,caption`
+				);
+				const body: Record<string, string> = {};
+				if ((cur?.caption?.raw ?? "") !== u.caption) body.caption = u.caption;
+				if (!cur?.alt_text) body.alt_text = u.caption;
+				if (Object.keys(body).length) await this.wp("POST", `media/${u.id}`, body);
+			} catch (e) {
+				this.warnings.push(`Couldn't update the media library caption for image ${u.id}`);
+				console.error("Wordpresser: media caption sync failed", e);
+			}
+		}
+	}
+
 	private obsidianToMarkdown(md: string): string {
 		return (
 			md
@@ -1597,7 +1870,9 @@ export default class WPPublisherPlugin extends Plugin {
 			await this.app.fileManager.processFrontMatter(file, (f) => {
 				f.title = state.title;
 				f.categories = state.categories;
-				f[this.settings.tagsProperty] = state.tags;
+				f[this.settings.tagsProperty] = this.settings.tagSlugs
+					? state.tags.map(slugify)
+					: state.tags;
 			});
 
 			const raw = await this.app.vault.read(file);
@@ -1605,6 +1880,8 @@ export default class WPPublisherPlugin extends Plugin {
 
 			progress.setMessage("Uploading images…");
 			body = await this.processImages(body, file.path);
+			await this.syncMediaMeta();
+			body = this.convertAlignMarkers(body);
 			body = this.obsidianToMarkdown(body);
 			body = this.finalizeImages(body);
 
@@ -1627,8 +1904,10 @@ export default class WPPublisherPlugin extends Plugin {
 			}) as string;
 
 			progress.setMessage("Syncing categories & tags…");
-			const categories = await this.resolveTerms("categories", state.categories);
-			const tags = await this.resolveTerms("tags", state.tags);
+			const categoryTerms = await this.resolveTerms("categories", state.categories);
+			const tagTerms = await this.resolveTerms("tags", state.tags);
+			const categories = categoryTerms.map((t) => t.id);
+			const tags = tagTerms.map((t) => t.id);
 
 			// Featured image
 			let featuredId: number | null = null;
@@ -1675,6 +1954,7 @@ export default class WPPublisherPlugin extends Plugin {
 				: await this.wp("POST", "posts", payload);
 
 			await this.app.fileManager.processFrontMatter(file, (f) => {
+				if (this.settings.tagSlugs) f[this.settings.tagsProperty] = tagTerms.map((t) => t.slug);
 				f.wp_id = post.id;
 				f.wp_url = post.link;
 				f.wp_status = post.status;
@@ -1720,6 +2000,7 @@ class ChipInput {
 	private chips: string[];
 	private options: string[] = [];
 	private counts = new Map<string, number>();
+	private slugToName = new Map<string, string>();
 	private wrap: HTMLElement;
 	private input: HTMLInputElement;
 	private listEl: HTMLElement;
@@ -1755,6 +2036,14 @@ class ChipInput {
 	setOptions(terms: TermInfo[]) {
 		this.options = terms.map((t) => t.name);
 		this.counts = new Map(terms.map((t) => [t.name.toLowerCase(), t.count]));
+		this.slugToName = new Map(terms.map((t) => [t.slug.toLowerCase(), t.name]));
+		// chips that were stored as slugs show as their full names
+		this.chips = this.chips.map(
+			(c) =>
+				this.options.find((o) => o.toLowerCase() === c.toLowerCase()) ??
+				this.slugToName.get(c.toLowerCase()) ??
+				c
+		);
 		this.renderChips();
 		if (document.activeElement === this.input) this.refresh();
 	}
@@ -1770,7 +2059,7 @@ class ChipInput {
 	private canon(raw: string): string {
 		const v = raw.trim().replace(/^#/, "");
 		const hit = this.options.find((o) => o.toLowerCase() === v.toLowerCase());
-		return hit ?? v;
+		return hit ?? this.slugToName.get(slugify(v)) ?? v;
 	}
 
 	private add(raw: string) {
@@ -1898,36 +2187,40 @@ class ChipInput {
 }
 
 /* ------------------------------------------------------------------ */
-/* Caption modal                                                       */
+/* Small text prompt (caption, rename)                                 */
 /* ------------------------------------------------------------------ */
 
-class CaptionModal extends Modal {
+class TextModal extends Modal {
 	private value: string;
 
 	constructor(
 		app: App,
-		initial: string,
-		private onSave: (caption: string) => void
+		private opts: {
+			title: string;
+			note: string;
+			placeholder: string;
+			initial: string;
+			onSave: (value: string) => void;
+		}
 	) {
 		super(app);
-		this.value = initial;
+		this.value = opts.initial;
 	}
 
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass("wpp-modal");
-		this.titleEl.setText("Image caption");
-		contentEl.createDiv({
-			cls: "wpp-status-note",
-			text: "Shown under the image on WordPress. Leave empty for no caption.",
-		});
+		this.titleEl.setText(this.opts.title);
+		contentEl.createDiv({ cls: "wpp-status-note", text: this.opts.note });
 
 		let input: HTMLInputElement | null = null;
 		new Setting(contentEl)
 			.addText((t) => {
 				input = t.inputEl;
-				t.setPlaceholder("Caption").setValue(this.value).onChange((v) => (this.value = v));
+				t.setPlaceholder(this.opts.placeholder)
+					.setValue(this.value)
+					.onChange((v) => (this.value = v));
 				t.inputEl.addEventListener("keydown", (e) => {
 					if (e.key === "Enter") {
 						e.preventDefault();
@@ -1941,13 +2234,15 @@ class CaptionModal extends Modal {
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
 			.addButton((b) => b.setButtonText("Save").setCta().onClick(() => this.save()));
 
-		window.setTimeout(() => (input as HTMLInputElement | null)?.focus(), 30);
+		window.setTimeout(() => {
+			const el = input as HTMLInputElement | null;
+			el?.focus();
+			el?.select();
+		}, 30);
 	}
 
 	private save() {
-		// keep the caption safe inside ![[file|caption]]
-		const clean = this.value.replace(/\|/g, "/").replace(/[\[\]]/g, "").trim();
-		this.onSave(clean);
+		this.opts.onSave(this.value);
 		this.close();
 	}
 
@@ -2298,6 +2593,29 @@ class WPSettingTab extends PluginSettingTab {
 		}
 
 		new Setting(containerEl)
+			.setName("Rename button on images")
+			.setDesc("Adds a Rename button to the hover controls and a Rename option to the right-click menu on images.")
+			.addToggle((t) =>
+				t.setValue(s.imageRename).onChange(async (v) => {
+					s.imageRename = v;
+					await this.plugin.saveSettings();
+					this.plugin.resetDecorations();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Fill in media library captions")
+			.setDesc(
+				"When publishing, an image's caption is also saved in the WordPress media library (and used as alt text if that's empty). If you reuse an image with different captions, the latest one wins."
+			)
+			.addToggle((t) =>
+				t.setValue(s.syncMediaCaption).onChange(async (v) => {
+					s.syncMediaCaption = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
 			.setName("Reuse existing images")
 			.setDesc(
 				"Dropping the same image again (same filename and contents) reuses the file already in the post folder instead of making \"logo 1.png\". When publishing, images already in your WordPress media library (same file contents, or same filename and size) are reused instead of uploaded again."
@@ -2356,6 +2674,18 @@ class WPSettingTab extends PluginSettingTab {
 						s.tagsProperty = v.trim() || "tags";
 						await this.plugin.saveSettings();
 					})
+			);
+
+		new Setting(containerEl)
+			.setName("Store tags as slugs")
+			.setDesc(
+				"Obsidian's tags property doesn't allow spaces, so \"3d printing\" shows red and crossed out. With this on, tags are saved in the note as WordPress slugs like 3d-printing, which Obsidian accepts. The publish window still shows the full names."
+			)
+			.addToggle((t) =>
+				t.setValue(s.tagSlugs).onChange(async (v) => {
+					s.tagSlugs = v;
+					await this.plugin.saveSettings();
+				})
 			);
 
 		new Setting(containerEl).setName("Editor").setHeading();
