@@ -1,9 +1,10 @@
 {
   "id": "wordpresser",
   "name": "Wordpresser",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "minAppVersion": "1.11.4",
   "description": "Write in Obsidian, publish to your self-hosted WordPress site. Drafts and updates, categories and tags, featured image, captions, and click-to-expand images.",
   "author": "Colton Onushko",
+  "authorUrl": "https://github.com/coltography",
   "isDesktopOnly": false
 }

@@ -59,6 +59,7 @@ interface WPSettings {
 	imageRename: boolean;
 	syncMediaCaption: boolean;
 	tagSlugs: boolean;
+	namedImages: Record<string, boolean>;
 	sizeMedium: number;
 	alignMenu: boolean;
 	perPostFolders: boolean;
@@ -87,6 +88,7 @@ const DEFAULT_SETTINGS: WPSettings = {
 	imageRename: true,
 	syncMediaCaption: true,
 	tagSlugs: true,
+	namedImages: {},
 	sizeMedium: 500,
 	alignMenu: true,
 	perPostFolders: true,
@@ -201,6 +203,15 @@ function buildEmbed(p: EmbedParts): string {
 	if (p.caption) bits.push(p.caption);
 	if (p.width) bits.push(p.width); // keep last
 	return `![[${bits.join("|")}]]`;
+}
+
+/** Camera / screenshot style names aren't useful as alt text. */
+function isDefaultImageName(name: string): boolean {
+	const n = name.trim();
+	if (/^(img|dsc|dscn|dscf|pxl|mvimg|vid|image|photo|picture|screenshot|screen shot|pasted image|whatsapp image|untitled)\b/i.test(n))
+		return true;
+	const digits = (n.match(/[0-9]/g) ?? []).length;
+	return digits >= 8 || (n.length > 0 && digits / n.length > 0.4);
 }
 
 function slugify(s: string): string {
@@ -504,9 +515,18 @@ export default class WPPublisherPlugin extends Plugin {
 						return;
 					}
 
+					// An image was renamed (or moved): remember that it has a real name now
+					if (f instanceof TFile && IMAGE_EXT.includes(f.extension.toLowerCase())) {
+						const oldBase = oldPath.split("/").pop()!.replace(/\.[^.]+$/, "");
+						const was = this.settings.namedImages[oldPath];
+						delete this.settings.namedImages[oldPath];
+						if (was || oldBase !== f.basename) this.settings.namedImages[f.path] = true;
+						await this.saveSettings();
+						return;
+					}
+
 					if (!(f instanceof TFile) || f.extension !== "md") return;
 					if (oldName === f.basename) return;
-
 					if (!this.settings.syncNameToTitle) return;
 
 					// 1) title property: after the rename has settled (the editor may still be busy)
@@ -1639,33 +1659,34 @@ export default class WPPublisherPlugin extends Plugin {
 		);
 	}
 
-	/** WordPress image block (supports "expand on click" lightbox, WP 6.4+). */
-	private unitBlock(u: ImgUnit, align: string | null, inRow = false): string {
+	/**
+	 * WordPress image block with "expand on click". Written exactly the way the
+	 * block editor saves it (so it stays valid there) and without an align class,
+	 * which made the lightbox open at the small size. Centering is done by the
+	 * row wrapper around it.
+	 */
+	private unitBlock(u: ImgUnit): string {
 		const attrs: Record<string, unknown> = {};
-		if (align === "center" || align === "right") attrs.align = align;
 		if (u.id) attrs.id = u.id;
+		if (u.width) attrs.width = `${u.width}px`;
 		attrs.sizeSlug = "full";
 		attrs.linkDestination = "none";
 		attrs.lightbox = { enabled: true };
 
-		const cls = ["wp-block-image"];
-		if (align === "center") cls.push("aligncenter");
-		if (align === "right") cls.push("alignright");
-		cls.push("size-full");
+		const cls = ["wp-block-image", "size-full"];
+		if (u.width) cls.push("is-resized");
 
-		const img = `<img src="${u.url}" alt="${esc(u.alt)}" class="${
-			u.id ? `wp-image-${u.id}` : ""
-		}"${
-			u.width ? ` style="width:${u.width}px;max-width:100%;height:auto"` : ""
-		}/>`;
+		const img =
+			`<img src="${u.url}" alt="${esc(u.alt)}"` +
+			(u.id ? ` class="wp-image-${u.id}"` : "") +
+			(u.width ? ` style="width:${u.width}px"` : "") +
+			`/>`;
 		const cap = u.caption
 			? `<figcaption class="wp-element-caption">${esc(u.caption)}</figcaption>`
 			: "";
 		return (
 			`<!-- wp:image ${JSON.stringify(attrs)} -->\n` +
-			`<figure class="${cls.join(" ")}"${
-				inRow ? ' style="margin:0;min-width:0"' : ""
-			}>${img}${cap}</figure>\n` +
+			`<figure class="${cls.join(" ")}">${img}${cap}</figure>\n` +
 			`<!-- /wp:image -->`
 		);
 	}
@@ -1692,20 +1713,12 @@ export default class WPPublisherPlugin extends Plugin {
 				const a = align ?? (this.settings.centerImages ? "center" : "left");
 
 				const j = a === "right" ? "flex-end" : a === "center" ? "center" : "flex-start";
-				const row = (inner: string) =>
-					`\n<div style="display:flex;justify-content:${j};align-items:flex-start;gap:8px;margin:1em 0">\n${inner}\n</div>\n`;
-
-				if (units.length === 1 && units[0].expand) {
-					out.push("\n" + this.unitBlock(units[0], a) + "\n");
-				} else {
-					out.push(
-						row(
-							units
-								.map((u) => (u.expand ? this.unitBlock(u, null, true) : this.unitHtml(u)))
-								.join("\n")
-						)
-					);
-				}
+				const wrap = units.some((u) => u.expand) ? "flex-wrap:wrap;" : "";
+				out.push(
+					`\n<div style="display:flex;${wrap}justify-content:${j};align-items:flex-start;gap:8px;margin:1em 0">\n${units
+						.map((u) => (u.expand ? this.unitBlock(u) : this.unitHtml(u)))
+						.join("\n")}\n</div>\n`
+				);
 			} else {
 				out.push(line.replace(tokenRe, (_m, i: string) => this.unitHtml(unitOf(i))));
 			}
@@ -1721,6 +1734,13 @@ export default class WPPublisherPlugin extends Plugin {
 		} catch {
 			return false;
 		}
+	}
+
+	/** Alt text from the file name, but only if someone gave the file a real name. */
+	private altFor(file: TFile): string {
+		const named = !!this.settings.namedImages[file.path];
+		if (!named && isDefaultImageName(file.basename)) return "";
+		return file.basename.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
 	}
 
 	private addUnit(u: ImgUnit): string {
@@ -1748,7 +1768,7 @@ export default class WPPublisherPlugin extends Plugin {
 				return this.addUnit({
 					id: media.id,
 					url: media.url,
-					alt: parts.caption || file.basename,
+					alt: parts.caption || this.altFor(file),
 					caption: this.settings.captionsFromAlt ? parts.caption : "",
 					width: parts.width.split("x")[0],
 					expand: parts.expand ?? this.settings.lightbox,
@@ -1780,7 +1800,7 @@ export default class WPPublisherPlugin extends Plugin {
 				return this.addUnit({
 					id: media.id,
 					url: media.url,
-					alt: alt || file.basename,
+					alt: alt || this.altFor(file),
 					caption: this.settings.captionsFromAlt ? alt : "",
 					width: "",
 					expand: this.settings.lightbox,
@@ -1821,7 +1841,7 @@ export default class WPPublisherPlugin extends Plugin {
 		if (!this.settings.syncMediaCaption) return;
 		const done = new Set<number>();
 		for (const u of this.imgUnits) {
-			if (!u.id || !u.caption || done.has(u.id)) continue;
+			if (!u.id || done.has(u.id) || (!u.caption && !u.alt)) continue;
 			done.add(u.id);
 			try {
 				const cur = await this.wp(
@@ -1829,11 +1849,11 @@ export default class WPPublisherPlugin extends Plugin {
 					`media/${u.id}?context=edit&_fields=id,alt_text,caption`
 				);
 				const body: Record<string, string> = {};
-				if ((cur?.caption?.raw ?? "") !== u.caption) body.caption = u.caption;
-				if (!cur?.alt_text) body.alt_text = u.caption;
+				if (u.caption && (cur?.caption?.raw ?? "") !== u.caption) body.caption = u.caption;
+				if (u.alt && !cur?.alt_text) body.alt_text = u.alt; // never overwrite alt text you set in WordPress
 				if (Object.keys(body).length) await this.wp("POST", `media/${u.id}`, body);
 			} catch (e) {
-				this.warnings.push(`Couldn't update the media library caption for image ${u.id}`);
+				this.warnings.push(`Couldn't update the media library details for image ${u.id}`);
 				console.error("Wordpresser: media caption sync failed", e);
 			}
 		}
