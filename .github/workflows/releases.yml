@@ -32,6 +32,7 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
+          fail_on_unmatched_files: false
           files: |
             main.js
             manifest.json
