@@ -1,6 +1,6 @@
 {
   "name": "wordpresser",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Publish Obsidian notes to self-hosted WordPress",
   "main": "main.js",
   "scripts": {

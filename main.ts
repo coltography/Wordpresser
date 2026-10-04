@@ -7,6 +7,7 @@ import {
 	MenuItem,
 	Modal,
 	Notice,
+	Platform,
 	Plugin,
 	PluginSettingTab,
 	SecretComponent,
@@ -217,7 +218,8 @@ const ALIGN_MARK = {
 	center: '<span class="wpp-c"></span>',
 	right: '<span class="wpp-r"></span>',
 };
-const ALIGN_RE = /\s*<span class="wpp-([cr])"><\/span>\s*$/;
+const ALIGN_ANY = /<span class="wpp-([cr])"><\/span>/;
+const ALIGN_STRIP = /\s*<span class="wpp-[cr]"><\/span>\s*/g;
 
 /** Editor extension: aligns marked lines and hides the marker in Live Preview. */
 const alignPlugin = ViewPlugin.fromClass(
@@ -249,18 +251,20 @@ const alignPlugin = ViewPlugin.fromClass(
 					pos = line.to + 1;
 					if (line.from <= last) continue;
 					last = line.from;
-					const m = /<span class="wpp-([cr])"><\/span>\s*$/.exec(line.text);
-					if (!m) continue;
+					const first = ALIGN_ANY.exec(line.text);
+					if (!first) continue;
 					all.add(
 						line.from,
 						line.from,
-						Decoration.line({ class: m[1] === "c" ? "wpp-line-center" : "wpp-line-right" })
+						Decoration.line({ class: first[1] === "c" ? "wpp-line-center" : "wpp-line-right" })
 					);
 					if (live) {
-						const rep = Decoration.replace({});
-						const s = line.from + m.index;
-						all.add(s, line.to, rep);
-						atomic.add(s, line.to, rep);
+						for (const m of line.text.matchAll(/<span class="wpp-[cr]"><\/span>/g)) {
+							const rep = Decoration.replace({});
+							const s = line.from + (m.index ?? 0);
+							all.add(s, s + m[0].length, rep);
+							atomic.add(s, s + m[0].length, rep);
+						}
 					}
 				}
 			}
@@ -326,6 +330,7 @@ export default class WPPublisherPlugin extends Plugin {
 	private warnings: string[] = [];
 	private hideStyleEl: HTMLStyleElement | null = null;
 	private renameTimers = new Map<string, number>();
+	private titleTimers = new Map<TFile, number>();
 	private restoreFns: (() => void)[] = [];
 	private imgUnits: ImgUnit[] = [];
 	private previewActions = new WeakMap<MarkdownView, HTMLElement>();
@@ -481,7 +486,7 @@ export default class WPPublisherPlugin extends Plugin {
 
 					// A post folder was renamed -> rename its note to match
 					if (f instanceof TFolder) {
-						if (!this.settings.perPostFolders || oldName === f.name) return;
+						if (!this.settings.syncNameToTitle || !this.settings.perPostFolders || oldName === f.name) return;
 						const note = f.children.find(
 							(c): c is TFile =>
 								c instanceof TFile && c.extension === "md" && c.basename === oldName
@@ -502,7 +507,12 @@ export default class WPPublisherPlugin extends Plugin {
 					if (!(f instanceof TFile) || f.extension !== "md") return;
 					if (oldName === f.basename) return;
 
-					// 1) rename its post folder to match
+					if (!this.settings.syncNameToTitle) return;
+
+					// 1) title property: after the rename has settled (the editor may still be busy)
+					if (this.inScope(f)) this.scheduleTitleSync(f);
+
+					// 2) rename its post folder to match
 					if (this.settings.perPostFolders) {
 						const folder = f.parent;
 						if (folder && !folder.isRoot() && folder.name === oldName) {
@@ -516,15 +526,6 @@ export default class WPPublisherPlugin extends Plugin {
 							}
 						}
 					}
-
-					// 2) keep the title property in step with the new name
-					if (this.settings.syncNameToTitle && this.inScope(f)) {
-						try {
-							await this.titleFromName(f);
-						} catch (e) {
-							console.error("Wordpresser title sync failed", e);
-						}
-					}
 				})
 			);
 
@@ -534,6 +535,19 @@ export default class WPPublisherPlugin extends Plugin {
 					if (!this.settings.syncNameToTitle) return;
 					if (f.extension !== "md" || !this.inScope(f)) return;
 					const t = cache.frontmatter?.title;
+					if (
+						cache.frontmatter &&
+						"title" in cache.frontmatter &&
+						(t == null || (typeof t === "string" && !t.trim()))
+					) {
+						// blank title -> fill it from the note name
+						window.clearTimeout(this.renameTimers.get(f.path));
+						this.renameTimers.set(
+							f.path,
+							window.setTimeout(() => void this.titleFromName(f).catch(() => {}), 2000)
+						);
+						return;
+					}
 					if (typeof t !== "string" || !sanitizeName(t)) return;
 					if (sanitizeName(t) === f.basename) return;
 					window.clearTimeout(this.renameTimers.get(f.path));
@@ -908,6 +922,7 @@ export default class WPPublisherPlugin extends Plugin {
 
 	/** Adds a small "Expand" checkbox and "Caption" button over images in the editor. */
 	private decorateEmbeds() {
+		if (Platform.isMobile) return; // long-press menu covers these on phones/tablets
 		this.app.workspace.containerEl
 			.querySelectorAll<HTMLElement>(".cm-content .internal-embed.image-embed:not(.wpp-decorated)")
 			.forEach((el) => {
@@ -1019,8 +1034,33 @@ export default class WPPublisherPlugin extends Plugin {
 		return true;
 	}
 
+	/** Run titleFromName shortly after a rename, then once more to catch an editor overwriting it. */
+	private scheduleTitleSync(file: TFile) {
+		window.clearTimeout(this.titleTimers.get(file));
+		this.titleTimers.set(
+			file,
+			window.setTimeout(async () => {
+				try {
+					await this.titleFromName(file);
+					window.setTimeout(() => void this.titleFromName(file).catch(() => {}), 700);
+				} catch (e) {
+					console.error("Wordpresser title sync failed", e);
+				}
+			}, 700)
+		);
+	}
+
 	/** Set the title property from the note's name, if it isn't already in step. */
 	private async titleFromName(file: TFile) {
+		if (/^Untitled( \d+)?$/i.test(file.basename)) return; // default names aren't real titles
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (view?.file === file) {
+			try {
+				await view.save();
+			} catch {
+				/* ignore */
+			}
+		}
 		const fm = await this.readFrontmatter(file);
 		if (!("title" in fm)) return; // note doesn't use a title property
 		const cur = fm.title == null ? "" : String(fm.title);
@@ -1193,7 +1233,7 @@ export default class WPPublisherPlugin extends Plugin {
 		const inner: string[] = [];
 		for (let n = innerStart; n <= innerEnd; n++) inner.push(line(n));
 
-		const hadMarks = inner.some((l) => ALIGN_RE.test(l));
+		const hadMarks = inner.some((l) => ALIGN_ANY.test(l));
 		if (align === "left" && !wrapped && !hadMarks) {
 			new Notice("This text isn't aligned yet.");
 			return;
@@ -1201,7 +1241,7 @@ export default class WPPublisherPlugin extends Plugin {
 
 		const processed = inner.map((l) => {
 			if (!l.trim()) return l;
-			const bare = l.replace(ALIGN_RE, "");
+			const bare = l.replace(ALIGN_STRIP, " ").trimEnd();
 			return align === "left" ? bare : `${bare} ${ALIGN_MARK[align]}`;
 		});
 
@@ -1604,7 +1644,6 @@ export default class WPPublisherPlugin extends Plugin {
 		const attrs: Record<string, unknown> = {};
 		if (align === "center" || align === "right") attrs.align = align;
 		if (u.id) attrs.id = u.id;
-		if (u.width) attrs.width = `${u.width}px`;
 		attrs.sizeSlug = "full";
 		attrs.linkDestination = "none";
 		attrs.lightbox = { enabled: true };
@@ -1613,11 +1652,12 @@ export default class WPPublisherPlugin extends Plugin {
 		if (align === "center") cls.push("aligncenter");
 		if (align === "right") cls.push("alignright");
 		cls.push("size-full");
-		if (u.width) cls.push("is-resized");
 
 		const img = `<img src="${u.url}" alt="${esc(u.alt)}" class="${
 			u.id ? `wp-image-${u.id}` : ""
-		}"${u.width ? ` style="width:${u.width}px"` : ""}/>`;
+		}"${
+			u.width ? ` style="width:${u.width}px;max-width:100%;height:auto"` : ""
+		}/>`;
 		const cap = u.caption
 			? `<figcaption class="wp-element-caption">${esc(u.caption)}</figcaption>`
 			: "";
@@ -1761,12 +1801,12 @@ export default class WPPublisherPlugin extends Plugin {
 			group = null;
 		};
 		for (const line of md.split("\n")) {
-			const m = line.match(ALIGN_RE);
+			const m = line.match(ALIGN_ANY);
 			if (m) {
 				const a = m[1] === "c" ? "center" : "right";
 				if (group && group.align !== a) flush();
 				if (!group) group = { align: a, lines: [] };
-				group.lines.push(line.replace(ALIGN_RE, ""));
+				group.lines.push(line.replace(ALIGN_STRIP, " ").trimEnd());
 			} else {
 				flush();
 				out.push(line);
@@ -2745,9 +2785,9 @@ class WPSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Keep note & folder name in sync with title")
+			.setName("Keep title, note name and folder name in sync")
 			.setDesc(
-				"When the title property changes (or on publish), the note and its folder are renamed to match."
+				"Renaming the note, the folder, or the note's title at the top, or editing the title property, updates all four. Turn off to manage them separately."
 			)
 			.addToggle((t) =>
 				t.setValue(s.syncNameToTitle).onChange(async (v) => {
